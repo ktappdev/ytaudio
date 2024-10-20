@@ -58,7 +58,7 @@ func main() {
 func parseFlags() Config {
 	var cfg Config
 
-	pflag.StringVarP(&cfg.Query, "query", "q", "", "Search query or YouTube URL")
+	pflag.StringVarP(&cfg.Query, "query", "d", "", "Download YouTube URL")
 	pflag.BoolVarP(&cfg.ListMode, "list", "l", false, "List videos instead of downloading")
 	pflag.StringVarP(&cfg.FilePath, "file", "f", "", "Path to file containing queries or URLs")
 	pflag.StringVarP(&cfg.PlaylistID, "playlist", "p", "", "YouTube playlist ID to download")
