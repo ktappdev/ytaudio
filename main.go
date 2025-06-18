@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -10,14 +11,17 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/kkdai/youtube/v2"
-	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/pflag"
+	"google.golang.org/api/option"
+	"google.golang.org/api/youtube/v3"
 )
 
 const (
@@ -43,6 +47,20 @@ type Config struct {
 type Video struct {
 	ID    string
 	Title string
+}
+
+type PlaylistDownloader struct {
+	APIKey           string
+	ConcurrentLimit  int
+	DownloadFunction func(string) error
+}
+
+func NewPlaylistDownloader(apiKey string, concurrentLimit int, downloadFunc func(string) error) *PlaylistDownloader {
+	return &PlaylistDownloader{
+		APIKey:           apiKey,
+		ConcurrentLimit:  concurrentLimit,
+		DownloadFunction: downloadFunc,
+	}
 }
 
 func main() {
@@ -310,70 +328,177 @@ func searchVideos(query string, apiKey string) ([]Video, error) {
 	return videos, nil
 }
 
-func downloadAudio(query string) error {
-	log.Printf("Initializing download for query: %s", query)
-	client := youtube.Client{}
-
-	log.Println("Fetching video information")
-	video, err := client.GetVideo(query)
+// checkYtDlpInstalled verifies that yt-dlp is available on the system
+func checkYtDlpInstalled() error {
+	cmd := exec.Command("yt-dlp", "--version")
+	err := cmd.Run()
 	if err != nil {
-		return fmt.Errorf("error getting video info: %w", err)
+		return fmt.Errorf("yt-dlp not found. Please install it with: brew install yt-dlp")
 	}
-	log.Printf("Video information fetched for: %s", video.Title)
+	return nil
+}
 
-	// Find the audio format with the highest bitrate
-	var format *youtube.Format
-	maxBitrate := 0
-	for _, f := range video.Formats.WithAudioChannels() {
-		if f.AudioQuality != "" && f.AverageBitrate > maxBitrate {
-			maxBitrate = f.AverageBitrate
-			format = &f
-		}
-	}
-
-	if format == nil {
-		return fmt.Errorf("no suitable audio format found")
+// downloadAudio downloads audio using yt-dlp (much more reliable than the Go library)
+func downloadAudio(videoID string) error {
+	log.Printf("Initializing yt-dlp download for video ID: %s", videoID)
+	
+	// Check if yt-dlp is installed
+	if err := checkYtDlpInstalled(); err != nil {
+		return err
 	}
 
-	log.Printf("Selected format: Audio Quality: %s, Mime Type: %s, Bitrate: %d",
-		format.AudioQuality, format.MimeType, format.AverageBitrate)
+	// Construct YouTube URL from video ID
+	videoURL := fmt.Sprintf("https://www.youtube.com/watch?v=%s", videoID)
+	downloadPath := getDownloadPath()
+	
+	log.Printf("Downloading from: %s", videoURL)
+	log.Printf("Download path: %s", downloadPath)
 
-	log.Println("Getting stream")
-	stream, size, err := client.GetStream(video, format)
-	if err != nil {
-		return fmt.Errorf("error getting stream: %w", err)
-	}
-	defer stream.Close()
-
-	fileName := sanitizeFileName(fmt.Sprintf("%s.mp3", video.Title))
-	filePath := filepath.Join(getDownloadPath(), fileName)
-	log.Printf("Saving audio to: %s", filePath)
-
-	out, err := os.Create(filePath)
-	if err != nil {
-		return fmt.Errorf("error creating file: %w", err)
-	}
-	defer out.Close()
-
-	bar := progressbar.DefaultBytes(
-		size,
-		"Downloading",
+	// yt-dlp command with options for audio-only download (more efficient)
+	cmd := exec.Command("yt-dlp",
+		"-f", "bestaudio",                    // Download only audio stream (more efficient)
+		"--extract-audio",                    // Extract audio only
+		"--audio-format", "mp3",              // Convert to MP3
+		"--audio-quality", "0",               // Best quality
+		"--output", filepath.Join(downloadPath, "%(title)s.%(ext)s"), // Output template
+		"--no-playlist",                      // Don't download playlists
+		"--embed-metadata",                   // Embed metadata
+		"--add-metadata",                     // Add metadata
+		videoURL,
 	)
 
-	log.Println("Copying audio data to file")
-	startTime := time.Now()
-	written, err := io.Copy(io.MultiWriter(out, bar), stream)
+	// Create a pipe to capture output for progress monitoring
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("error saving file: %w", err)
+		return fmt.Errorf("error creating stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("error creating stderr pipe: %w", err)
+	}
+
+	// Start the command
+	log.Println("Starting yt-dlp download...")
+	startTime := time.Now()
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("error starting yt-dlp: %w", err)
+	}
+
+	// Monitor progress from stderr (yt-dlp outputs progress to stderr)
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		progressRegex := regexp.MustCompile(`\[(\d+\.\d+)%\]`)
+		
+		for scanner.Scan() {
+			line := scanner.Text()
+			log.Printf("yt-dlp: %s", line)
+			
+			// Extract progress percentage
+			if matches := progressRegex.FindStringSubmatch(line); len(matches) > 1 {
+				if progress, err := strconv.ParseFloat(matches[1], 64); err == nil {
+					fmt.Printf("\rProgress: %.1f%%", progress)
+				}
+			}
+		}
+	}()
+
+	// Also capture stdout
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			log.Printf("yt-dlp stdout: %s", scanner.Text())
+		}
+	}()
+
+	// Wait for the command to complete
+	err = cmd.Wait()
+	if err != nil {
+		return fmt.Errorf("yt-dlp download failed: %w", err)
 	}
 
 	duration := time.Since(startTime)
-	speed := float64(written) / duration.Seconds() / 1024 // KB/s
-
-	log.Println("Download completed successfully")
-	fmt.Printf("\nDownloaded: %s\n", filePath)
-	fmt.Printf("Download speed: %.2f KB/s\n", speed)
+	log.Printf("Download completed successfully in %v", duration)
+	fmt.Printf("\nDownload completed in %v\n", duration)
+	fmt.Printf("Files saved to: %s\n", downloadPath)
+	
 	return nil
+}
+
+func (pd *PlaylistDownloader) DownloadPlaylist(playlistID string) error {
+	ctx := context.Background()
+	youtubeService, err := youtube.NewService(ctx, option.WithAPIKey(pd.APIKey))
+	if err != nil {
+		return fmt.Errorf("error creating YouTube client: %w", err)
+	}
+
+	videos, err := pd.getPlaylistVideos(youtubeService, playlistID)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Found %d videos in playlist", len(videos))
+
+	jobs := make(chan string, len(videos))
+	results := make(chan error, len(videos))
+
+	var wg sync.WaitGroup
+	for w := 1; w <= pd.ConcurrentLimit; w++ {
+		wg.Add(1)
+		go pd.worker(jobs, results, &wg)
+	}
+
+	for _, video := range videos {
+		jobs <- video
+	}
+	close(jobs)
+
+	wg.Wait()
+	close(results)
+
+	for err := range results {
+		if err != nil {
+			log.Printf("Error downloading video: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func (pd *PlaylistDownloader) getPlaylistVideos(service *youtube.Service, playlistID string) ([]string, error) {
+	var videos []string
+	nextPageToken := ""
+
+	for {
+		call := service.PlaylistItems.List([]string{"snippet"}).
+			PlaylistId(playlistID).
+			MaxResults(50).
+			PageToken(nextPageToken)
+
+		response, err := call.Do()
+		if err != nil {
+			return nil, fmt.Errorf("error fetching playlist items: %w", err)
+		}
+
+		for _, item := range response.Items {
+			videos = append(videos, item.Snippet.ResourceId.VideoId)
+		}
+
+		nextPageToken = response.NextPageToken
+		if nextPageToken == "" {
+			break
+		}
+	}
+
+	return videos, nil
+}
+
+func (pd *PlaylistDownloader) worker(jobs <-chan string, results chan<- error, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for videoID := range jobs {
+		log.Printf("Downloading video: %s", videoID)
+		err := pd.DownloadFunction(videoID)
+		results <- err
+	}
 }
 
 func downloadPlaylist(cfg Config) error {
