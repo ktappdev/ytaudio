@@ -43,7 +43,10 @@ func ParseFlags() *Config {
 
 	cfg.APIKey = os.Getenv("api_key")
 	if cfg.APIKey == "" {
-		log.Fatal("YouTube API key not found in environment variables")
+		cfg.APIKey = os.Getenv("youtube_api_key") // Fallback to youtube_api_key
+	}
+	if cfg.APIKey == "" {
+		log.Fatal("YouTube API key not found in environment variables (checked api_key and youtube_api_key)")
 	}
 
 	if songQuery != "" {
@@ -91,4 +94,5 @@ func ShowHelp() {
 	fmt.Println()
 	fmt.Println("ENVIRONMENT:")
 	fmt.Println("  api_key                     YouTube Data API key (required)")
+	fmt.Println("  youtube_api_key             Alternative YouTube Data API key (used if api_key is not set)")
 }
