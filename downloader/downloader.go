@@ -106,7 +106,7 @@ func DownloadAudio(videoID string) error {
 	// Start the command
 	log.Println("Starting yt-dlp download...")
 	startTime := time.Now()
-	if err := cmd.Start(); err != nil {
+	if startErr := cmd.Start(); startErr != nil {
 		return fmt.Errorf("error starting yt-dlp: %w", err)
 	}
 
@@ -121,7 +121,7 @@ func DownloadAudio(videoID string) error {
 
 			// Extract progress percentage
 			if matches := progressRegex.FindStringSubmatch(line); len(matches) > 1 {
-				if progress, err := strconv.ParseFloat(matches[1], 64); err == nil {
+				if progress, parseErr := strconv.ParseFloat(matches[1], 64); parseErr == nil {
 					fmt.Printf("\rProgress: %.1f%%", progress)
 				}
 			}
