@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kkdai/youtube/v2"
@@ -31,6 +33,10 @@ type Config struct {
 	SongMode            bool
 	PlaylistID          string
 	ConcurrentDownloads int
+	SongListMode        bool
+	SongList            string
+	SongCSVFile         string
+	ShowHelp            bool
 }
 
 // Video represents a YouTube video with its ID and Title
@@ -63,6 +69,9 @@ func parseFlags() Config {
 	pflag.StringVarP(&cfg.FilePath, "file", "f", "", "Path to file containing queries or URLs")
 	pflag.StringVarP(&cfg.PlaylistID, "playlist", "p", "", "YouTube playlist ID to download")
 	pflag.IntVarP(&cfg.ConcurrentDownloads, "concurrent", "c", 3, "Number of concurrent downloads")
+	pflag.StringVarP(&cfg.SongList, "songs", "m", "", "Comma-separated list of songs to download")
+	pflag.StringVar(&cfg.SongCSVFile, "csv-file", "", "Path to CSV file with Artist,Song format")
+	pflag.BoolVarP(&cfg.ShowHelp, "help", "h", false, "Show help message")
 
 	var songQuery string
 	pflag.StringVarP(&songQuery, "song", "s", "", "Search for a song using 'artist - song name' format")
@@ -80,22 +89,82 @@ func parseFlags() Config {
 		cfg.SongMode = true
 	}
 
+	if cfg.SongList != "" {
+		cfg.SongListMode = true
+	}
+
+	if cfg.SongCSVFile != "" {
+		cfg.SongListMode = true
+	}
+
 	return cfg
+}
+
+// showHelp displays the help message with all available commands and flags
+func showHelp() {
+	fmt.Println("YouTube Audio Downloader")
+	fmt.Println("========================")
+	fmt.Println()
+	fmt.Println("USAGE:")
+	fmt.Println("  ytaudio [flags]")
+	fmt.Println()
+	fmt.Println("FLAGS:")
+	fmt.Println("  -d, --query <url>           Download audio from YouTube URL")
+	fmt.Println("  -s, --song <query>          Search and download song using 'artist - song name' format")
+	fmt.Println("  -l, --list                  List videos instead of downloading")
+	fmt.Println("  -f, --file <path>           Process queries from file (one per line)")
+	fmt.Println("  -p, --playlist <id>         Download entire YouTube playlist")
+	fmt.Println("  -m, --songs <list>          Download comma-separated list of songs")
+	fmt.Println("      --csv-file <path>       Download songs from CSV file (Artist,Song format)")
+	fmt.Println("  -c, --concurrent <num>      Number of concurrent downloads (default: 3)")
+	fmt.Println("  -h, --help                  Show this help message")
+	fmt.Println()
+	fmt.Println("EXAMPLES:")
+	fmt.Println("  ytaudio -d \"https://www.youtube.com/watch?v=dQw4w9WgXcQ\"")
+	fmt.Println("  ytaudio -s \"Rick Astley - Never Gonna Give You Up\"")
+	fmt.Println("  ytaudio -p \"PLrAXtmRdnEQy4Qy9RMp-3X30f3gWD1CUr\"")
+	fmt.Println("  ytaudio -m \"Song 1, Song 2, Song 3\" -c 5")
+	fmt.Println("  ytaudio --csv-file songs.csv -c 2")
+	fmt.Println("  ytaudio -f queries.txt")
+	fmt.Println()
+	fmt.Println("ENVIRONMENT:")
+	fmt.Println("  api_key                     YouTube Data API key (required)")
 }
 
 // run executes the main program logic based on the provided configuration
 func run(cfg Config) error {
 	log.Println("Starting main program execution")
+	
+	// Check if help flag is set or no command is provided
+	if cfg.ShowHelp {
+		showHelp()
+		return nil
+	}
+	
+	// Check if no command is provided
+	if cfg.Query == "" && cfg.FilePath == "" && cfg.PlaylistID == "" && !cfg.SongListMode {
+		showHelp()
+		return nil
+	}
+	
 	switch {
 	case cfg.PlaylistID != "":
 		log.Printf("Downloading playlist: %s", cfg.PlaylistID)
 		return downloadPlaylist(cfg)
+	case cfg.SongListMode:
+		if cfg.SongCSVFile != "" {
+			log.Printf("Downloading songs from CSV file: %s", cfg.SongCSVFile)
+		} else {
+			log.Printf("Downloading song list: %s", cfg.SongList)
+		}
+		return downloadSongList(cfg)
 	case cfg.FilePath != "":
 		log.Printf("Processing file: %s", cfg.FilePath)
 		return processFile(cfg)
 	case cfg.Query == "":
 		log.Println("No query provided")
-		return fmt.Errorf("no query provided")
+		showHelp()
+		return nil
 	case cfg.ListMode:
 		log.Printf("Listing videos for query: %s", cfg.Query)
 		return listVideos(cfg)
@@ -314,6 +383,147 @@ func downloadAudio(query string) error {
 func downloadPlaylist(cfg Config) error {
 	downloader := NewPlaylistDownloader(cfg.APIKey, cfg.ConcurrentDownloads, downloadAudio)
 	return downloader.DownloadPlaylist(cfg.PlaylistID)
+}
+
+// downloadSongList downloads multiple songs from a comma-separated list or CSV file with concurrency
+func downloadSongList(cfg Config) error {
+	log.Printf("Parsing song list with %d concurrent downloads", cfg.ConcurrentDownloads)
+	
+	var cleanSongs []string
+	var err error
+	
+	if cfg.SongCSVFile != "" {
+		// Read songs from CSV file
+		cleanSongs, err = readSongsFromCSV(cfg.SongCSVFile)
+		if err != nil {
+			return fmt.Errorf("error reading CSV file: %w", err)
+		}
+	} else {
+		// Split the comma-separated list and clean up each song
+		songs := strings.Split(cfg.SongList, ",")
+		for _, song := range songs {
+			song = strings.TrimSpace(song)
+			if song != "" {
+				cleanSongs = append(cleanSongs, song)
+			}
+		}
+	}
+	
+	if len(cleanSongs) == 0 {
+		return fmt.Errorf("no valid songs found in the list")
+	}
+	
+	log.Printf("Found %d songs to download", len(cleanSongs))
+	
+	// Create channels for job distribution
+	jobs := make(chan string, len(cleanSongs))
+	results := make(chan error, len(cleanSongs))
+	
+	// Start worker goroutines
+	var wg sync.WaitGroup
+	for w := 1; w <= cfg.ConcurrentDownloads; w++ {
+		wg.Add(1)
+		go songWorker(jobs, results, &wg, cfg.APIKey)
+	}
+	
+	// Send jobs
+	for _, song := range cleanSongs {
+		jobs <- song
+	}
+	close(jobs)
+	
+	// Wait for all workers to finish
+	wg.Wait()
+	close(results)
+	
+	// Collect and report results
+	var errors []error
+	for err := range results {
+		if err != nil {
+			log.Printf("Error downloading song: %v", err)
+			errors = append(errors, err)
+		}
+	}
+	
+	log.Printf("Completed downloading %d songs with %d errors", len(cleanSongs), len(errors))
+	
+	if len(errors) > 0 {
+		return fmt.Errorf("encountered %d errors during download", len(errors))
+	}
+	
+	return nil
+}
+
+// songWorker processes individual songs from the job queue
+func songWorker(jobs <-chan string, results chan<- error, wg *sync.WaitGroup, apiKey string) {
+	defer wg.Done()
+	for song := range jobs {
+		log.Printf("Processing song: %s", song)
+		
+		// Search for the song
+		videos, err := searchVideos(song+" audio", apiKey)
+		if err != nil {
+			log.Printf("Error searching for '%s': %v", song, err)
+			results <- fmt.Errorf("search failed for '%s': %w", song, err)
+			continue
+		}
+		
+		if len(videos) == 0 {
+			log.Printf("No videos found for song: %s", song)
+			results <- fmt.Errorf("no videos found for '%s'", song)
+			continue
+		}
+		
+		// Download the first result
+		log.Printf("Downloading first result for '%s': %s", song, videos[0].Title)
+		err = downloadAudio(videos[0].ID)
+		if err != nil {
+			log.Printf("Error downloading '%s': %v", song, err)
+			results <- fmt.Errorf("download failed for '%s': %w", song, err)
+		} else {
+			log.Printf("Successfully downloaded: %s", song)
+			results <- nil
+		}
+	}
+}
+
+// readSongsFromCSV reads songs from a CSV file with Artist,Song format
+func readSongsFromCSV(filePath string) ([]string, error) {
+	log.Printf("Reading songs from CSV file: %s", filePath)
+	
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("error opening CSV file: %w", err)
+	}
+	defer file.Close()
+	
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("error reading CSV file: %w", err)
+	}
+	
+	var songs []string
+	for i, record := range records {
+		// Skip header row if it exists
+		if i == 0 && len(record) >= 2 && (strings.ToLower(record[0]) == "artist" || strings.ToLower(record[1]) == "song") {
+			log.Println("Skipping header row")
+			continue
+		}
+		
+		if len(record) >= 2 {
+			artist := strings.TrimSpace(record[0])
+			song := strings.TrimSpace(record[1])
+			if artist != "" && song != "" {
+				songQuery := fmt.Sprintf("%s - %s", artist, song)
+				songs = append(songs, songQuery)
+				log.Printf("Added song: %s", songQuery)
+			}
+		}
+	}
+	
+	log.Printf("Successfully read %d songs from CSV file", len(songs))
+	return songs, nil
 }
 
 // getDownloadPath returns the path to save downloaded files
