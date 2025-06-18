@@ -48,10 +48,8 @@ type Video struct {
 func main() {
 	// Set up logging to include timestamps
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-	log.Println("Starting YouTube audio downloader")
 
 	cfg := parseFlags()
-	log.Printf("Parsed configuration: %+v", cfg)
 
 	if err := run(cfg); err != nil {
 		log.Fatalf("Error: %v", err)
@@ -82,7 +80,6 @@ func parseFlags() Config {
 	if cfg.APIKey == "" {
 		log.Fatal("YouTube API key not found in environment variables")
 	}
-	log.Println("YouTube API key loaded from environment variables")
 
 	if songQuery != "" {
 		cfg.Query = songQuery
@@ -133,7 +130,6 @@ func showHelp() {
 
 // run executes the main program logic based on the provided configuration
 func run(cfg Config) error {
-	log.Println("Starting main program execution")
 	
 	// Check if help flag is set or no command is provided
 	if cfg.ShowHelp {
